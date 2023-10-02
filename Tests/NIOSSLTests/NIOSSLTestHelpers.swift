@@ -661,10 +661,10 @@ func generateSelfSignedCert(keygenFunction: () -> OpaquePointer = generateRSAPri
     }
     CNIOBoringSSL_X509_set_issuer_name(x, name)
     
-    addExtension(x509: x, nid: NID_basic_constraints, value: "critical,CA:FALSE")
+    addExtension(x509: x, nid: NID_basic_constraints, value: "critical,CA:TRUE")
     addExtension(x509: x, nid: NID_subject_key_identifier, value: "hash")
     addExtension(x509: x, nid: NID_subject_alt_name, value: "DNS:localhost")
-    addExtension(x509: x, nid: NID_ext_key_usage, value: "critical,serverAuth,clientAuth")
+    addExtension(x509: x, nid: NID_ext_key_usage, value: "serverAuth,clientAuth")
     
     CNIOBoringSSL_X509_sign(x, pkey, CNIOBoringSSL_EVP_sha256())
     

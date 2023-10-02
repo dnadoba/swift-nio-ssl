@@ -37,17 +37,27 @@ func generateDependencies() -> [Package.Dependency] {
     if ProcessInfo.processInfo.environment["SWIFTCI_USE_LOCAL_DEPS"] == nil {
         return [
             .package(url: "https://github.com/apple/swift-nio.git", from: "2.54.0"),
+            .package(url: "https://github.com/apple/swift-asn1.git", from: "1.0.0-beta.1"),
+            .package(url: "https://github.com/apple/swift-certificates.git", from: "1.0.0-beta.1"),
             .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0"),
         ]
     } else {
         return [
             .package(path: "../swift-nio"),
+            .package(path: "../swift-asn1"),
+            .package(path: "../swift-certificates"),
         ]
     }
 }
 
 let package = Package(
     name: "swift-nio-ssl",
+    platforms: [
+        .macOS(.v10_15),
+        .iOS(.v13),
+        .watchOS(.v6),
+        .tvOS(.v13),
+    ],
     products: [
         .library(name: "NIOSSL", targets: ["NIOSSL"]),
         .executable(name: "NIOTLSServer", targets: ["NIOTLSServer"]),
@@ -73,6 +83,8 @@ MANGLE_END */
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
                 .product(name: "NIOTLS", package: "swift-nio"),
+                .product(name: "SwiftASN1", package: "swift-asn1"),
+                .product(name: "X509", package: "swift-certificates"),
             ]),
         .executableTarget(
             name: "NIOTLSServer",

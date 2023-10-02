@@ -15,6 +15,9 @@
 import NIOCore
 @_implementationOnly import CNIOBoringSSL
 @_implementationOnly import CNIOBoringSSLShims
+import X509
+import SwiftASN1
+import Foundation
 
 #if canImport(Darwin)
 import Darwin.C
@@ -434,11 +437,106 @@ public final class NIOSSLContext {
         }
 
         let conn = SSLConnection(ownedSSL: ssl, parentContext: self)
+        
+        func loadCertificates(from filePath: String) throws -> [Certificate] {
+            if FileManager.default.fileExistsAndIsDirectory(atPath: filePath) {
+                print("iterating directory at: \(filePath)")
+   
+                return try FileManager.default.contentsOfDirectory(atPath: filePath).compactMap { childFilePath in
+                    try loadCertificate(from: filePath + "/" + childFilePath)
+                }
+            } else {
+                return try loadCertificate(from: filePath).map { [$0] } ?? []
+            }
+        }
+        
+        func loadCertificate(from filePath: String) throws -> Certificate? {
+            print("resolving symbolic links in file path:", filePath)
+            var filePath = filePath
+            var prevFilePath = filePath
+            repeat {
+                prevFilePath = filePath
+                print("trying to follow \(filePath)")
+                let root = filePath.split(separator: "/", omittingEmptySubsequences: false).dropLast().joined(separator: "/")
+                do {
+                    filePath = try FileManager.default.destinationOfSymbolicLink(atPath: filePath)
+                } catch {
+                    // not a symlink, we break out
+                    break
+                }
+                if filePath.first != "/"{
+                    filePath = root + "/" + filePath
+                }
+                if prevFilePath != filePath {
+                    print("followed file path from \(prevFilePath) to \(filePath)")
+                }
+            } while prevFilePath != filePath
+            print("loading certificate at: \(filePath)")
+            let fileName = filePath.split(separator: "/").last
+            if fileName == "ca-certificates.crt" {
+                // this contains all certificates in a single pem which we don't want to parse here
+                return nil
+            }
+            let fileExtension = filePath.split(separator: ".").last?.lowercased()
+            if fileExtension == "pem" || fileExtension == "crt" {
+                let certificate = try Certificate(pemEncoded: String(contentsOfFile: filePath))
+                print(certificate)
+                return certificate
+            } else {
+                let derEncodedBytes = try Array(Data(contentsOf: URL(fileURLWithPath: filePath)))
+                let certificate = try Certificate(derEncoded: derEncodedBytes[...])
+                print(certificate)
+                return certificate
+            }
+        }
+        
+        func setSwiftCertificatesVerifier(rootCertificates: [Certificate]) throws {
+            var rootCertificates = rootCertificates
+            for additionalTrustRoot in configuration.additionalTrustRoots {
+                switch additionalTrustRoot {
+                case .file(let filePath):
+                    rootCertificates.append(contentsOf: try loadCertificates(from: filePath))
+                case .certificates(let certificates):
+                    rootCertificates.append(contentsOf: try certificates.lazy.map { try Certificate($0) })
+                }
+            }
+            let rootStore = CertificateStore(rootCertificates)
+            conn.setCustomVerificationCallback(CustomVerifyManager(callback: { promise in
+                do {
+                    let (leaf, intermediates) = try conn.getPeerChainAsSwiftCertificates()
+                    promise.completeWithTask {
+                        let validationTime = Date()
+                        var verifier = Verifier(rootCertificates: rootStore) {
+                            RFC5280Policy(validationTime: validationTime)
+                        }
+                        var diagnosticsLog = [VerificationDiagnostic]()
+                        let validationResult = await verifier.validate(
+                            leafCertificate: leaf,
+                            intermediates: CertificateStore(intermediates),
+                            diagnosticCallback: { diagnosticsLog.append($0) }
+                        )
+                        switch validationResult {
+                        case .validCertificate:
+                            return .certificateVerified
+                        case .couldNotValidate(let array):
+                            print("could not validate certificate chain", array)
+                            print("diagnostics:")
+                            print(diagnosticsLog.lazy.map { $0.multilineDescription }.joined(separator: "\n"))
+                            return .failed
+                        }
+                    }
+                } catch {
+                    print("failed to get peer chain", error)
+                    promise.succeed(.failed)
+                }
+            }))
+        }
 
         // If we need to turn on the validation on Apple platforms, do it here.
-        #if canImport(Darwin)
+        
         switch self.configuration.trustRoots {
         case .some(.default), .none:
+            #if canImport(Darwin)
             conn.setCustomVerificationCallback(CustomVerifyManager(callback: {
                 do {
                     conn.performSecurityFrameworkValidation(promise: $0, peerCertificates: try conn.getPeerCertificatesAsSecCertificate())
@@ -446,10 +544,39 @@ public final class NIOSSLContext {
                     $0.fail(error)
                 }
             }))
-        case .some(.certificates), .some(.file):
-            break
+            #elseif os(Linux) || os(FreeBSD)
+            do {
+                let roots = try rootCADirectoryPath.map { try loadCertificates(from: $0) } ?? []
+                try setSwiftCertificatesVerifier(rootCertificates: roots)
+            } catch {
+                print(error)
+                return nil
+            }
+            #else
+            #error("unsupported OS")
+            #endif
+        case .some(.certificates(let certificates)):
+            do {
+                try setSwiftCertificatesVerifier(
+                    rootCertificates: certificates.map { try Certificate($0) }
+                )
+            } catch {
+                print(error)
+                return nil
+            }
+        case .some(.file(let filePath)):
+            do {
+                try setSwiftCertificatesVerifier(
+                    rootCertificates: loadCertificates(from: filePath)
+                )
+            } catch {
+                print(error)
+                return nil
+            }
         }
-        #endif
+        
+        
+        
 
         return conn
     }
@@ -467,6 +594,37 @@ public final class NIOSSLContext {
 
     deinit {
         CNIOBoringSSL_SSL_CTX_free(self.sslContext)
+    }
+}
+
+extension FileManager {
+    func fileExistsAndIsDirectory(
+        atPath path: String
+    ) -> Bool {
+        var isDirectory: ObjCBool = false
+        let exists = self.fileExists(atPath: path, isDirectory: &isDirectory)
+        return exists && isDirectory.boolValue
+    }
+}
+
+extension SSLConnection {
+    func getPeerChainAsSwiftCertificates() throws -> (leaf: Certificate, intermediates: [Certificate]) {
+        try self.withPeerCertificateChainBuffers { buffers in
+            guard let buffers = buffers else {
+                throw NIOSSLError.unableToValidateCertificate
+            }
+            var chainBuffer = buffers[...]
+            guard let leaf = chainBuffer.popFirst() else {
+                throw NIOSSLError.unableToValidateCertificate
+            }
+            
+            return (
+                leaf: try Certificate(derEncoded: Array(leaf)[...]),
+                intermediates: try chainBuffer.map { intermediate in
+                    try Certificate(derEncoded: Array(intermediate)[...])
+                }
+            )
+        }
     }
 }
 

@@ -15,6 +15,8 @@
 @_implementationOnly import CNIOBoringSSL
 @_implementationOnly import CNIOBoringSSLShims
 import NIOCore
+import X509
+import SwiftASN1
 
 #if canImport(Darwin)
 import Darwin.C
@@ -456,5 +458,12 @@ extension UnsafePointer where Pointee == ASN1_TIME {
 
         // 86400 seconds in a day
         return time_t(day) * 86400 + time_t(seconds)
+    }
+}
+
+
+extension Certificate {
+    init(_ certificate: NIOSSLCertificate) throws {
+        try self.init(derEncoded: certificate.toDERBytes()[...])
     }
 }
